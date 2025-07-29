@@ -1,12 +1,13 @@
 package raft
 
 import (
-	"6.5840/labgob"
 	"bytes"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"6.5840/labgob"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -46,6 +47,9 @@ type Raft struct {
 
 	//inspiration from sofajraft, or check etcd or tikv with more details
 	replicatorCond []*sync.Cond // condition variable for replicator goroutine
+
+	// 梯度同步扩展
+	gradientManager *GradientManager // 梯度管理器
 }
 
 // ChangeState depends on its state to do stuffs
@@ -456,6 +460,11 @@ func (rf *Raft) applier() {
 		// send the apply message to applyCh for service/State Machine Replica
 		// async..
 		for _, entry := range entries {
+			// 处理梯度日志
+			if gradLog, ok := entry.Command.(GradientLog); ok {
+				rf.handleGradientLog(gradLog)
+			}
+
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
@@ -480,27 +489,73 @@ func (rf *Raft) HasLogInCurrentTerm() bool {
 	return rf.getLastLog().Term == rf.currentTerm
 }
 
+// ========== 梯度同步扩展接口 ==========
+
+// SubmitGradient 提交梯度到Raft集群
+func (rf *Raft) SubmitGradient(grad GradientLog) (int, int, bool) {
+	// 使用现有的Start接口提交梯度日志
+	return rf.Start(grad)
+}
+
+// GetGradientStats 获取梯度同步统计信息
+func (rf *Raft) GetGradientStats() map[string]interface{} {
+	if rf.gradientManager == nil {
+		return map[string]interface{}{
+			"error": "gradient manager not initialized",
+		}
+	}
+	return rf.gradientManager.GetStats()
+}
+
+// GetModelState 获取当前模型状态
+func (rf *Raft) GetModelState() *ModelState {
+	if rf.gradientManager == nil {
+		return nil
+	}
+	return rf.gradientManager.GetModelState()
+}
+
+// handleGradientLog 处理梯度日志
+func (rf *Raft) handleGradientLog(gradLog GradientLog) {
+	if rf.gradientManager == nil {
+		return
+	}
+
+	// 添加梯度到缓冲区
+	if rf.gradientManager.AddGradient(gradLog) {
+		// 达到聚合条件，执行聚合
+		aggGrad := rf.gradientManager.AggregateGradients(gradLog.BatchID)
+		if aggGrad != nil {
+			// 应用聚合梯度到模型
+			rf.gradientManager.ApplyGradientToModel(aggGrad)
+			DPrintf("{Node %v} applied aggregated gradient for batch %v with %v workers",
+				rf.me, aggGrad.BatchID, aggGrad.WorkerCount)
+		}
+	}
+}
+
 // Make to make a raft node
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
-		mu:             sync.RWMutex{},
-		peers:          peers,
-		persister:      persister,
-		me:             me,
-		dead:           0,
-		currentTerm:    0,
-		votedFor:       -1,
-		logs:           make([]LogEntry, 1), // dummy entry at index 0
-		commitIndex:    0,
-		lastApplied:    0,
-		nextIndex:      make([]int, len(peers)),
-		matchIndex:     make([]int, len(peers)),
-		state:          Follower,
-		electionTimer:  time.NewTimer(RandomElectionTimeout()),
-		heartbeatTimer: time.NewTimer(StableHeartbeatTimeout()),
-		applyCh:        applyCh,
-		replicatorCond: make([]*sync.Cond, len(peers)),
+		mu:              sync.RWMutex{},
+		peers:           peers,
+		persister:       persister,
+		me:              me,
+		dead:            0,
+		currentTerm:     0,
+		votedFor:        -1,
+		logs:            make([]LogEntry, 1), // dummy entry at index 0
+		commitIndex:     0,
+		lastApplied:     0,
+		nextIndex:       make([]int, len(peers)),
+		matchIndex:      make([]int, len(peers)),
+		state:           Follower,
+		electionTimer:   time.NewTimer(RandomElectionTimeout()),
+		heartbeatTimer:  time.NewTimer(StableHeartbeatTimeout()),
+		applyCh:         applyCh,
+		replicatorCond:  make([]*sync.Cond, len(peers)),
+		gradientManager: NewGradientManager(0.001), // 初始化梯度管理器，学习率0.001
 	}
 
 	// initialize from state persisted before a crash( to regain persistence info
