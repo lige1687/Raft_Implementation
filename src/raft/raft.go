@@ -50,6 +50,9 @@ type Raft struct {
 
 	// 梯度同步扩展
 	gradientManager *GradientManager // 梯度管理器
+	
+	// 联邦学习扩展
+	federatedManager *FederatedLearningManager // 联邦学习管理器
 }
 
 // ChangeState depends on its state to do stuffs
@@ -76,6 +79,11 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 	return rf.currentTerm, rf.state == Leader
+}
+
+// GetNodeID returns the node ID
+func (rf *Raft) GetNodeID() int {
+	return rf.me
 }
 
 func (rf *Raft) GetRaftStateSize() int {
@@ -464,6 +472,11 @@ func (rf *Raft) applier() {
 			if gradLog, ok := entry.Command.(GradientLog); ok {
 				rf.handleGradientLog(gradLog)
 			}
+			
+			// 处理联邦学习日志
+			if fedLog, ok := entry.Command.(FederatedLogEntry); ok {
+				rf.applyFederatedCommand(fedLog)
+			}
 
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
@@ -553,9 +566,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		state:           Follower,
 		electionTimer:   time.NewTimer(RandomElectionTimeout()),
 		heartbeatTimer:  time.NewTimer(StableHeartbeatTimeout()),
-		applyCh:         applyCh,
-		replicatorCond:  make([]*sync.Cond, len(peers)),
-		gradientManager: NewGradientManager(0.001), // 初始化梯度管理器，学习率0.001
+		applyCh:          applyCh,
+		replicatorCond:   make([]*sync.Cond, len(peers)),
+		gradientManager:  NewGradientManager(0.001), // 初始化梯度管理器，学习率0.001
+		federatedManager: NewFederatedLearningManager(), // 初始化联邦学习管理器
 	}
 
 	// initialize from state persisted before a crash( to regain persistence info
