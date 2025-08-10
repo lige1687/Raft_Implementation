@@ -1,195 +1,123 @@
 import torch
 import torch.nn as nn
-import grpc
-import numpy as np
+import requests
 from typing import Dict, List, Optional
 import threading
 import time
 
-# 简化的protobuf消息结构
-class GradientMessage:
-    def __init__(self, epoch: int, worker_id: int, batch_id: int, 
-                 param_name: str, gradients: List[float]):
-        self.epoch = epoch
-        self.worker_id = worker_id
-        self.batch_id = batch_id
-        self.param_name = param_name
-        self.gradients = gradients
-
-class AggregatedGradientMessage:
-    def __init__(self, epoch: int, batch_id: int, worker_count: int,
-                 gradients: Dict[str, List[float]]):
-        self.epoch = epoch
-        self.batch_id = batch_id
-        self.worker_count = worker_count
-        self.gradients = gradients
-
-class MockGRPCStub:
-    """模拟gRPC客户端，用于测试"""
-    
-    def __init__(self):
-        self.submitted_gradients = []
-        self.aggregated_gradients = {}
-    
-    def SubmitGradient(self, request):
-        """模拟提交梯度"""
-        grad_msg = GradientMessage(
-            epoch=request.epoch,
-            worker_id=request.worker_id,
-            batch_id=request.batch_id,
-            param_name=request.param_name,
-            gradients=request.gradients
-        )
-        self.submitted_gradients.append(grad_msg)
-        print(f"模拟提交梯度: Worker={request.worker_id}, Batch={request.batch_id}, Param={request.param_name}")
-        return type('Response', (), {'success': True})()
-    
-    def GetAggregatedGradients(self, request):
-        """模拟获取聚合梯度"""
-        # 模拟聚合逻辑
-        if self.submitted_gradients:
-            latest = self.submitted_gradients[-1]
-            aggregated = AggregatedGradientMessage(
-                epoch=latest.epoch,
-                batch_id=latest.batch_id,
-                worker_count=3,
-                gradients={
-                    "weight1": [0.2, 0.3, 0.4],
-                    "weight2": [0.5, 0.6, 0.7]
-                }
-            )
-            return aggregated
-        return None
-
 class RaftClient:
-    """Raft梯度同步客户端"""
+    """基于HTTP的Raft梯度同步客户端"""
     
-    def __init__(self, server_address: str = "localhost:50051", worker_id: int = 0):
-        self.server_address = server_address
+    def __init__(self, server_address: str = "http://127.0.0.1:8080", worker_id: int = 0):
+        self.server_address = server_address.rstrip('/')
         self.worker_id = worker_id
         self.epoch = 0
         self.batch_id = 0
-        
-        # 初始化gRPC连接（这里使用模拟客户端）
-        self.stub = MockGRPCStub()
         
         # 梯度缓冲区
         self.gradient_buffer = {}
         self.buffer_lock = threading.Lock()
         
-        print(f"Raft客户端初始化完成: WorkerID={worker_id}")
+        print(f"Raft HTTP 客户端初始化完成: WorkerID={worker_id}, Server={self.server_address}")
     
     def submit_gradient(self, param_name: str, gradients: torch.Tensor) -> bool:
-        """提交梯度到Raft集群"""
+        """提交梯度到HTTP服务"""
         try:
-            # 转换为numpy数组
             grad_array = gradients.detach().cpu().numpy().flatten().tolist()
+            payload = {
+                "epoch": self.epoch,
+                "worker_id": self.worker_id,
+                "batch_id": self.batch_id,
+                "gradients": {param_name: grad_array},
+            }
+            url = f"{self.server_address}/submit_gradient"
+            resp = requests.post(url, json=payload, timeout=5)
+            ok = resp.status_code == 200 and resp.json().get("ok", False)
             
-            # 创建梯度消息
-            grad_msg = GradientMessage(
-                epoch=self.epoch,
-                worker_id=self.worker_id,
-                batch_id=self.batch_id,
-                param_name=param_name,
-                gradients=grad_array
-            )
-            
-            # 提交到Raft集群
-            response = self.stub.SubmitGradient(grad_msg)
-            
-            # 缓存梯度
             with self.buffer_lock:
                 if self.batch_id not in self.gradient_buffer:
                     self.gradient_buffer[self.batch_id] = {}
                 self.gradient_buffer[self.batch_id][param_name] = gradients.clone()
-            
-            return response.success
-            
+            return ok
         except Exception as e:
             print(f"提交梯度失败: {e}")
             return False
     
     def get_aggregated_gradients(self) -> Optional[Dict[str, torch.Tensor]]:
-        """获取聚合梯度"""
+        """获取聚合梯度（按当前batch_id查询）"""
         try:
-            response = self.stub.GetAggregatedGradients(None)
-            if response is None:
+            url = f"{self.server_address}/aggregated?batch_id={self.batch_id}"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code != 200:
                 return None
-            
-            # 转换为PyTorch张量
+            data = resp.json()
+            if not data or (isinstance(data, dict) and data.get("found") is False):
+                return None
             aggregated = {}
-            for param_name, grad_values in response.gradients.items():
+            for param_name, grad_values in data.get("Gradients", data.get("gradients", {})).items():
                 tensor = torch.tensor(grad_values, dtype=torch.float32)
                 aggregated[param_name] = tensor
-            
-            return aggregated
-            
+            return aggregated if aggregated else None
         except Exception as e:
             print(f"获取聚合梯度失败: {e}")
             return None
     
     def set_epoch(self, epoch: int):
-        """设置当前训练轮次"""
         self.epoch = epoch
     
     def set_batch_id(self, batch_id: int):
-        """设置当前批次ID"""
         self.batch_id = batch_id
 
 class RaftOptimizer(torch.optim.Optimizer):
-    """基于Raft的优化器"""
+    """基于Raft的优化器（HTTP版）"""
     
     def __init__(self, params, lr=0.001, raft_client: RaftClient = None):
         super().__init__(params, {'lr': lr})
         self.raft_client = raft_client or RaftClient()
-        self.param_groups = list(params)
+        # 建立name->param映射
+        self.name_to_param: Dict[str, torch.nn.Parameter] = {}
+    
+    def bind_model(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            self.name_to_param[name] = param
     
     def step(self, closure=None):
-        """执行优化步骤"""
         loss = None
         if closure is not None:
             loss = closure()
-        
-        # 获取聚合梯度
         aggregated_grads = self.raft_client.get_aggregated_gradients()
-        if aggregated_grads is None:
-            print("未获取到聚合梯度，跳过更新")
+        if not aggregated_grads:
             return loss
-        
-        # 应用聚合梯度到参数
-        for group in self.param_groups:
-            for param in group['params']:
-                if param.grad is None:
-                    continue
-                
-                param_name = param._get_name()
-                if param_name in aggregated_grads:
-                    # 使用聚合梯度更新参数
-                    param.data -= group['lr'] * aggregated_grads[param_name]
-                    print(f"应用聚合梯度到参数: {param_name}")
-        
+        # 应用聚合梯度
+        for name, param in self.name_to_param.items():
+            if name in aggregated_grads:
+                grad = aggregated_grads[name]
+                # 尺寸对齐（服务端按flatten返回，这里简单截断/填充）
+                if grad.numel() != param.data.numel():
+                    flat = grad.flatten()
+                    target = torch.zeros_like(param.data.flatten())
+                    n = min(flat.numel(), target.numel())
+                    target[:n] = flat[:n]
+                    grad = target.view_as(param.data)
+                else:
+                    grad = grad.view_as(param.data)
+                param.data -= self.param_groups[0]['lr'] * grad
         return loss
 
-def register_raft_hooks(model: nn.Module, raft_client: RaftClient):
-    """为模型参数注册Raft梯度Hook"""
+def register_raft_hooks(model: nn.Module, raft_client: RaftClient, optimizer: Optional[RaftOptimizer] = None):
+    """为模型参数注册Raft梯度Hook，并绑定优化器映射"""
+    if optimizer is not None:
+        optimizer.bind_model(model)
     
     def create_gradient_hook(param_name: str):
         def hook(grad):
             if grad is not None:
-                # 提交梯度到Raft集群
-                success = raft_client.submit_gradient(param_name, grad)
-                if success:
-                    print(f"梯度已提交: {param_name}")
-                else:
-                    print(f"梯度提交失败: {param_name}")
+                raft_client.submit_gradient(param_name, grad)
         return hook
     
-    # 为每个参数注册hook
     for name, param in model.named_parameters():
         if param.requires_grad:
-            hook = create_gradient_hook(name)
-            param.register_hook(hook)
-            print(f"已为参数注册Raft Hook: {name}")
+            param.register_hook(create_gradient_hook(name))
 
 # 测试函数
 def test_raft_integration():

@@ -150,3 +150,5 @@ echo "📈 Check the logs for training results and model convergence"
 
 # 清理进程
 cleanup
+
+

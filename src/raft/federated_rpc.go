@@ -269,3 +269,5 @@ func (rf *Raft) applyFederatedCommand(cmd interface{}) {
 		}
 	}
 }
+
+
